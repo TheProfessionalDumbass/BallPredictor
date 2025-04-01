@@ -1,0 +1,938 @@
+local player = game.Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local character
+if player.Character then
+    character = player.Character
+else
+    character = player.CharacterAdded:Wait()
+end
+
+local humanoid
+local rootPart
+local ball
+
+-- Goal tracking variables
+local playerGoal = nil
+local opponentGoal = nil
+local playerTeam = nil -- "Home" or "Away"
+
+local function waitForComponents()
+    local maxAttempts = 10
+    local attempts = 0
+
+    while not humanoid and attempts < maxAttempts do
+        humanoid = character:FindFirstChild("Humanoid")
+        if not humanoid then
+            wait(0.5)
+            attempts = attempts + 1
+        end
+    end
+
+    attempts = 0
+    while not rootPart and attempts < maxAttempts do
+        rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then
+            wait(0.5)
+            attempts = attempts + 1
+        end
+    end
+
+    attempts = 0
+    while not ball and attempts < maxAttempts do
+        ball = workspace:FindFirstChild("Football")
+        if not ball then
+            wait(0.5)
+            attempts = attempts + 1
+        end
+    end
+
+    return humanoid and rootPart and ball
+end
+
+local function findGoals()
+    -- Find goal posts in the workspace
+    local goals = {}
+    for _, obj in pairs(workspace:GetChildren()) do
+        if obj.Name == "Goal" or obj.Name == "Goal2" then
+            table.insert(goals, obj)
+        end
+    end
+    
+    if #goals < 2 then
+        warn("Couldn't find both goals!")
+        return false
+    end
+    
+    -- Determine which goal is closest to the player
+    local closestDist = math.huge
+    local closestGoal = nil
+    local farthestGoal = nil
+    
+    for _, goal in pairs(goals) do
+        local goalPos = goal:IsA("Model") and goal:GetPrimaryPartCFrame().Position or goal.Position
+        local dist = (rootPart.Position - goalPos).Magnitude
+        
+        if dist < closestDist then
+            farthestGoal = closestGoal
+            closestGoal = goal
+            closestDist = dist
+        elseif not farthestGoal or dist > closestDist then
+            farthestGoal = goal
+        end
+    end
+    
+    playerGoal = closestGoal
+    opponentGoal = farthestGoal
+    
+    -- Determine which team the player is on
+    playerTeam = playerGoal.Name == "Goal" and "Home" or "Away"
+    
+    return true
+end
+
+if not waitForComponents() then
+    warn("Failed to find all required components!")
+    return
+end
+
+if not findGoals() then
+    warn("Failed to identify goals!")
+    return
+end
+
+local modifyBallSizeEnabled = false
+local CONFIG = {
+    PREDICTION_POINTS = 20,      -- Reduced from 30 to improve performance
+    PREDICTION_TIME = 2,         
+    PREDICTION_STEP = 0.1,       
+    HITBOX_MULTIPLIER = 3,       
+    ACTIVATION_DISTANCE = 10,    
+    LINE_THICKNESS = 0.5,        -- Reduced thickness to improve performance
+    LINE_COLOR = Color3.fromRGB(255, 0, 0),  
+
+    SPEED_SLOW = 5,              
+    SPEED_MEDIUM = 20,           
+    SPEED_FAST = 40,             
+
+    COLOR_SLOW = Color3.fromRGB(255, 0, 0),      
+    COLOR_MEDIUM = Color3.fromRGB(255, 165, 0),  
+    COLOR_FAST = Color3.fromRGB(0, 255, 0),
+    
+    -- Shadow configuration
+    SHADOW_COLOR = Color3.fromRGB(0, 200, 255),
+    SHADOW_TRANSPARENCY = 0.7,
+    SHADOW_ACTIVATION_DISTANCE = 15,
+    SHADOW_GUIDE_THICKNESS = 0.2,
+    
+    -- Performance optimization
+    UPDATE_INTERVAL = 0.1, -- Only update predictions every 0.1 seconds
+    MAX_SHADOW_DISTANCE = 5, -- Maximum distance shadow can be from player
+    
+    -- Goal tracking
+    GOAL_DEPTH = 5 -- Approximate depth of the goal area
+}
+
+local predictingActive = false
+local originalBallSize = ball.Size
+local originalBallColor = ball.Color
+local predictionParts = {}
+local predictionEndPoint = nil -- Store end point of prediction for shadow guidance
+
+-- Shadow character variables
+local shadowCharacter = nil
+local shadowParts = {}
+local shadowActive = false
+local guideLine = nil
+
+local lastUpdateTime = 0
+
+local ballHighlight = Instance.new("Highlight")
+ballHighlight.Name = "VelocityHighlight"
+ballHighlight.FillTransparency = 0.5
+ballHighlight.OutlineTransparency = 0
+ballHighlight.FillColor = CONFIG.COLOR_SLOW
+ballHighlight.OutlineColor = CONFIG.COLOR_SLOW
+ballHighlight.Parent = ball
+
+local playerGui
+if player:FindFirstChild("PlayerGui") then
+    playerGui = player.PlayerGui
+else
+    wait(1)
+    playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then
+        warn("PlayerGui not found!")
+        return
+    end
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "GKHelper"
+gui.ResetOnSpawn = false
+gui.Parent = playerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 200, 0, 160)
+mainFrame.Position = UDim2.new(0, 10, 0, 10)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+mainFrame.BackgroundTransparency = 0.3
+mainFrame.BorderSizePixel = 2
+mainFrame.Parent = gui
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, 0, 0, 25)
+titleLabel.Position = UDim2.new(0, 0, 0, 0)
+titleLabel.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+titleLabel.BackgroundTransparency = 0.3
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.Text = "Goalkeeper Helper"
+titleLabel.TextSize = 16
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.Parent = mainFrame
+
+local distanceLabel = Instance.new("TextLabel")
+distanceLabel.Size = UDim2.new(1, 0, 0, 25)
+distanceLabel.Position = UDim2.new(0, 0, 0, 30)
+distanceLabel.BackgroundTransparency = 1
+distanceLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+distanceLabel.Text = "Ball Distance: 0m"
+distanceLabel.TextSize = 14
+distanceLabel.Font = Enum.Font.Gotham
+distanceLabel.Parent = mainFrame
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.new(1, 0, 0, 25)
+speedLabel.Position = UDim2.new(0, 0, 0, 55)
+speedLabel.BackgroundTransparency = 1
+speedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedLabel.Text = "Ball Speed: 0m/s"
+speedLabel.TextSize = 14
+speedLabel.Font = Enum.Font.Gotham
+speedLabel.Parent = mainFrame
+
+local teamLabel = Instance.new("TextLabel")
+teamLabel.Size = UDim2.new(1, 0, 0, 25)
+teamLabel.Position = UDim2.new(0, 0, 0, 80)
+teamLabel.BackgroundTransparency = 1
+teamLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+teamLabel.Text = "Team: Detecting..."
+teamLabel.TextSize = 14
+teamLabel.Font = Enum.Font.Gotham
+teamLabel.Parent = mainFrame
+
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(1, -20, 0, 30)
+toggleButton.Position = UDim2.new(0, 10, 0, 105)
+toggleButton.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.Text = "Prediction: OFF"
+toggleButton.TextSize = 14
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.Parent = mainFrame
+
+local shadowToggleButton = Instance.new("TextButton")
+shadowToggleButton.Size = UDim2.new(1, -20, 0, 30)
+shadowToggleButton.Position = UDim2.new(0, 10, 0, 140)
+shadowToggleButton.BackgroundColor3 = Color3.fromRGB(50, 150, 150)
+shadowToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+shadowToggleButton.Text = "Shadow Guide: ON"
+shadowToggleButton.TextSize = 14
+shadowToggleButton.Font = Enum.Font.GothamBold
+shadowToggleButton.Parent = mainFrame
+
+local mangaMessageGui = Instance.new("ScreenGui")
+mangaMessageGui.Name = "MangaMessage"
+mangaMessageGui.ResetOnSpawn = false
+mangaMessageGui.Parent = playerGui
+
+local mangaMessage = Instance.new("TextLabel")
+mangaMessage.Size = UDim2.new(0.8, 0, 0.2, 0)
+mangaMessage.Position = UDim2.new(0.1, 0, 0.4, 0)
+mangaMessage.BackgroundTransparency = 1
+mangaMessage.TextColor3 = Color3.fromRGB(255, 255, 255)
+mangaMessage.Text = "Auf die Knie, Blue Lock!\nYour Kaiser has arrived!"
+mangaMessage.TextSize = 48
+mangaMessage.Font = Enum.Font.Bangers
+mangaMessage.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+mangaMessage.TextStrokeTransparency = 0
+mangaMessage.TextWrapped = true
+mangaMessage.RichText = true
+mangaMessage.TextScaled = true
+mangaMessage.Parent = mangaMessageGui
+
+-- Function declarations
+local function setShadowVisibility(visible)
+    if not shadowCharacter then return end
+    
+    shadowCharacter.Parent = visible and workspace or nil
+    shadowActive = visible
+end
+
+local function animateMangaMessage()
+    mangaMessage.Size = UDim2.new(0, 1, 0, 1)
+    mangaMessage.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+    local growTween = game:GetService("TweenService"):Create(
+        mangaMessage,
+        TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        {Size = UDim2.new(0.8, 0, 0.2, 0), Position = UDim2.new(0.1, 0, 0.4, 0)}
+    )
+    growTween:Play()
+
+    task.spawn(function()
+        for i = 1, 6 do
+            mangaMessage.Rotation = math.random(-2, 2)
+            wait(0.05)
+        end
+        mangaMessage.Rotation = 0
+    end)
+
+    task.delay(5, function()
+        local fadeTween = game:GetService("TweenService"):Create(
+            mangaMessage,
+            TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+            {TextTransparency = 1, TextStrokeTransparency = 1}
+        )
+        fadeTween:Play()
+
+        fadeTween.Completed:Connect(function()
+            mangaMessageGui:Destroy()
+        end)
+    end)
+end
+
+-- Create the shadow character
+local function createShadowCharacter()
+    -- If shadow exists already, destroy it
+    if shadowCharacter then
+        shadowCharacter:Destroy()
+        shadowCharacter = nil
+    end
+    
+    shadowParts = {}
+    
+    -- Create a new model for the shadow
+    shadowCharacter = Instance.new("Model")
+    shadowCharacter.Name = "PlayerShadow"
+    shadowCharacter.Parent = workspace
+    
+    -- Clone parts from the character but optimize by only creating key parts
+    local keyPartsToClone = {
+        "HumanoidRootPart", "Head", "UpperTorso", "LowerTorso", 
+        "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+        "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg"
+    }
+    
+    local partsToClone = {}
+    for _, partName in ipairs(keyPartsToClone) do
+        local part = character:FindFirstChild(partName)
+        if part then
+            table.insert(partsToClone, part)
+        end
+    end
+    
+    -- If we couldn't find the key parts (older character models), just use all parts
+    if #partsToClone == 0 then
+        for _, part in pairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                table.insert(partsToClone, part)
+            end
+        end
+    end
+    
+    for _, part in ipairs(partsToClone) do
+        local shadowPart = Instance.new("Part")
+        shadowPart.Name = part.Name .. "_Shadow"
+        shadowPart.Size = part.Size
+        shadowPart.CFrame = part.CFrame
+        shadowPart.Anchored = true
+        shadowPart.CanCollide = false
+        shadowPart.Material = Enum.Material.Neon
+        shadowPart.Color = CONFIG.SHADOW_COLOR
+        shadowPart.Transparency = CONFIG.SHADOW_TRANSPARENCY
+        shadowPart.Parent = shadowCharacter
+        
+        table.insert(shadowParts, {original = part, shadow = shadowPart})
+    end
+    
+    -- Add a highlight to make it more visible
+    local highlight = Instance.new("Highlight")
+    highlight.FillColor = CONFIG.SHADOW_COLOR
+    highlight.OutlineColor = CONFIG.SHADOW_COLOR
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.Parent = shadowCharacter
+    
+    -- Initial state - invisible
+    setShadowVisibility(false)
+    
+    return shadowCharacter
+end
+
+-- Draw a line from player to shadow position
+local function drawGuideLine(startPos, endPos)
+    if guideLine then
+        guideLine:Destroy()
+    end
+    
+    local distance = (endPos - startPos).Magnitude
+    if distance < 1 then return end
+    
+    local midPoint = (startPos + endPos) / 2
+    local direction = (endPos - startPos).Unit
+    
+    guideLine = Instance.new("Part")
+    guideLine.Name = "GuideLine"
+    guideLine.Anchored = true
+    guideLine.CanCollide = false
+    guideLine.Size = Vector3.new(CONFIG.SHADOW_GUIDE_THICKNESS, CONFIG.SHADOW_GUIDE_THICKNESS, distance)
+    guideLine.CFrame = CFrame.lookAt(midPoint, midPoint + direction)
+    guideLine.Color = CONFIG.SHADOW_COLOR
+    guideLine.Material = Enum.Material.Neon
+    guideLine.Transparency = 0.3
+    guideLine.Parent = workspace
+end
+
+-- Check if a ball trajectory will go towards player's goal
+local function isBallHeadingTowardsPlayerGoal()
+    if not ball or not playerGoal or not rootPart then return false end
+
+    -- Get goal position
+    local goalPos = playerGoal:IsA("Model") and playerGoal:GetPrimaryPartCFrame().Position or playerGoal.Position
+    
+    -- Check if ball is on opponent's side
+    local ballPos = ball.Position
+    local playerToGoal = (goalPos - rootPart.Position).Unit
+    local playerToBall = (ballPos - rootPart.Position).Unit
+    
+    -- If dot product is negative, ball is behind player (not between player and goal)
+    if playerToGoal:Dot(playerToBall) < 0 then
+        return false
+    end
+    
+    -- Check if ball velocity is heading towards goal
+    local ballVel = ball.AssemblyLinearVelocity
+    local ballToGoal = (goalPos - ballPos).Unit
+    
+    -- If dot product is positive, ball is heading towards goal
+    return ballVel:Dot(ballToGoal) > 0.3 and ballVel.Magnitude > 3
+end
+
+-- Calculate optimal diving/interception position based on ball trajectory
+local function calculateOptimalInterceptPosition()
+    if not predictionEndPoint or not ball or not rootPart or not playerGoal then 
+        return nil 
+    end
+    
+    -- If ball is not heading towards player's goal, don't show shadow
+    if not isBallHeadingTowardsPlayerGoal() then
+        return nil
+    end
+    
+    -- Get goal position and create a goal line
+    local goalPos = playerGoal:IsA("Model") and playerGoal:GetPrimaryPartCFrame().Position or playerGoal.Position
+    
+    -- Find the closest point on ball trajectory to the player's current position
+    local ballPos = ball.Position
+    local ballVel = ball.AssemblyLinearVelocity
+    
+    -- Get prediction end point (where ball will be)
+    local targetPos = predictionEndPoint
+    
+    -- If prediction endpoint is too far or not heading toward goal, don't show shadow
+    if (targetPos - rootPart.Position).Magnitude > CONFIG.SHADOW_ACTIVATION_DISTANCE then
+        return nil
+    end
+    
+    -- Calculate diving vector (perpendicular to ball trajectory in horizontal plane)
+    local trajectoryVec = (targetPos - ballPos).Unit
+    local diveVec = Vector3.new(trajectoryVec.Z, 0, -trajectoryVec.X).Unit
+    
+    -- Project the trajectory to the player's height plane
+    local playerPlanePos = Vector3.new(targetPos.X, rootPart.Position.Y, targetPos.Z)
+    
+    -- Calculate optimal intercept position (slightly offset towards diving direction)
+    local diveOffset = math.min(CONFIG.MAX_SHADOW_DISTANCE, (targetPos - rootPart.Position).Magnitude * 0.7)
+    local interceptPos = playerPlanePos + diveVec * diveOffset
+    
+    -- Make sure the intercept position isn't too far from player
+    local distToIntercept = (interceptPos - rootPart.Position).Magnitude
+    if distToIntercept > CONFIG.MAX_SHADOW_DISTANCE then
+        interceptPos = rootPart.Position + (interceptPos - rootPart.Position).Unit * CONFIG.MAX_SHADOW_DISTANCE
+    end
+    
+    return interceptPos
+end
+
+-- Clean up shadow resources
+local function cleanupShadow()
+    if shadowCharacter then
+        shadowCharacter:Destroy()
+        shadowCharacter = nil
+    end
+    
+    if guideLine then
+        guideLine:Destroy()
+        guideLine = nil
+    end
+end
+
+local function updateBallHighlight()
+    if not ball or not ballHighlight then return end
+
+    local velocity = ball.AssemblyLinearVelocity
+    local speed = velocity.Magnitude
+
+    local highlightColor
+    if speed >= CONFIG.SPEED_FAST then
+        highlightColor = CONFIG.COLOR_FAST
+    elseif speed >= CONFIG.SPEED_MEDIUM then
+        highlightColor = CONFIG.COLOR_MEDIUM
+    else
+        highlightColor = CONFIG.COLOR_SLOW
+    end
+
+    ballHighlight.FillColor = highlightColor
+    ballHighlight.OutlineColor = highlightColor
+
+    speedLabel.Text = string.format("Ball Speed: %d m/s", math.floor(speed))
+
+    local transparency = math.max(0.2, 0.7 - (speed / 100))
+    ballHighlight.FillTransparency = transparency
+end
+
+local function stopBallCompletely()
+    if ball then
+        ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        ball.Velocity = Vector3.new(0, 0, 0)
+        ball.RotVelocity = Vector3.new(0, 0, 0)
+        ball.Anchored = true
+        wait(0.1)
+        ball.Anchored = false
+    end
+end
+
+local function modifyBallSize(enable)
+    if not modifyBallSizeEnabled then return end
+
+    if enable then
+        ball.Size = originalBallSize * CONFIG.HITBOX_MULTIPLIER
+        ball.Transparency = 0.5
+    else
+        ball.Size = originalBallSize
+        ball.Transparency = 0
+    end
+end
+
+local function cleanupPrediction()
+    for _, part in pairs(predictionParts) do
+        part:Destroy()
+    end
+    predictionParts = {}
+    predictionEndPoint = nil
+end
+
+local function createPredictionPart(position, index, total)
+    local part = Instance.new("Part")
+    part.Name = "PredictionPoint" .. index
+    part.Anchored = true
+    part.CanCollide = false
+    part.Size = Vector3.new(CONFIG.LINE_THICKNESS, CONFIG.LINE_THICKNESS, CONFIG.LINE_THICKNESS)
+    part.Position = position
+
+    local colorFactor = index / total
+    part.Color = Color3.fromRGB(
+        255 * colorFactor,
+        255 * (1 - colorFactor),
+        0
+    )
+
+    part.Material = Enum.Material.Neon
+    part.Transparency = 0.2
+    part.Parent = workspace
+
+    table.insert(predictionParts, part)
+    return part
+end
+
+local function connectPoints(point1, point2, index)
+    local distance = (point2 - point1).Magnitude
+    if distance < 0.1 then return end
+
+    local midPoint = (point1 + point2) / 2
+    local direction = (point2 - point1).Unit
+
+    local connector = Instance.new("Part")
+    connector.Name = "Connector" .. index
+    connector.Anchored = true
+    connector.CanCollide = false
+    connector.Size = Vector3.new(CONFIG.LINE_THICKNESS, CONFIG.LINE_THICKNESS, distance)
+    connector.CFrame = CFrame.lookAt(midPoint, midPoint + direction)
+
+    local colorFactor = index / CONFIG.PREDICTION_POINTS
+    connector.Color = Color3.fromRGB(
+        255 * colorFactor,
+        255 * (1 - colorFactor),
+        0
+    )
+
+    connector.Material = Enum.Material.Neon
+    connector.Transparency = 0.2
+    connector.Parent = workspace
+
+    table.insert(predictionParts, connector)
+end
+
+-- Update the shadow position based on ball prediction
+local function updateShadowPosition()
+    if not shadowCharacter or not rootPart or shadowToggleButton.Text == "Shadow Guide: OFF" then
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+        setShadowVisibility(false)
+        return
+    end
+    
+    -- If prediction isn't active, shadow shouldn't be active
+    if not predictingActive or not predictionEndPoint then
+        setShadowVisibility(false)
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+        return
+    }
+    
+    local interceptPos = calculateOptimalInterceptPosition()
+    
+    -- If no valid position, hide the shadow
+    if not interceptPos then
+        setShadowVisibility(false)
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+        return
+    end
+    
+    -- Check if ball is touching the character
+    local isTouchingBall = false
+    for _, part in pairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if (part.Position - ball.Position).Magnitude < (part.Size.Magnitude/2 + ball.Size.Magnitude/2) then
+                isTouchingBall = true
+                break
+            end
+        end
+    end
+    
+    -- Hide shadow if touching ball
+    if isTouchingBall then
+        setShadowVisibility(false)
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+        return
+    end
+    
+    -- Show and position shadow
+    setShadowVisibility(true)
+    
+    -- Position offset between root and original shadow parts
+    for _, partPair in ipairs(shadowParts) do
+        if partPair.original and partPair.shadow then
+            -- Calculate relative position to root
+            local relativeOffset = partPair.original.CFrame:ToObjectSpace(rootPart.CFrame)
+            
+            -- Apply this offset to the shadow
+            local shadowCFrame = CFrame.new(interceptPos) * relativeOffset
+            
+            -- Add a slight diving pose to the shadow
+            local diveDir = (interceptPos - rootPart.Position).Unit
+            local diveAngle = math.rad(15) -- 15 degree dive
+            local diveRotation = CFrame.fromAxisAngle(Vector3.new(diveDir.Z, 0, -diveDir.X), diveAngle)
+            
+            -- Apply the rotation to make the shadow dive
+            shadowCFrame = shadowCFrame * diveRotation
+            
+            -- Animate the movement
+            TweenService:Create(
+                partPair.shadow,
+                TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {CFrame = shadowCFrame}
+            ):Play()
+        end
+    end
+    
+    -- Draw a line from player to shadow position
+    drawGuideLine(rootPart.Position, interceptPos)
+    
+    -- Also draw a line from shadow to ball prediction endpoint
+    if predictionEndPoint then
+        local connectionLine = Instance.new("Part")
+        connectionLine.Name = "BallConnectionLine"
+        connectionLine.Anchored = true
+        connectionLine.CanCollide = false
+        
+        local distance = (interceptPos - predictionEndPoint).Magnitude
+        connectionLine.Size = Vector3.new(CONFIG.SHADOW_GUIDE_THICKNESS, CONFIG.SHADOW_GUIDE_THICKNESS, distance)
+        
+        local midPoint = (interceptPos + predictionEndPoint) / 2
+        local direction = (predictionEndPoint - interceptPos).Unit
+        
+        connectionLine.CFrame = CFrame.lookAt(midPoint, midPoint + direction)
+        connectionLine.Color = Color3.fromRGB(255, 255, 0) -- Yellow connection line
+        connectionLine.Material = Enum.Material.Neon
+        connectionLine.Transparency = 0.5
+        connectionLine.Parent = workspace
+        
+        table.insert(predictionParts, connectionLine) -- Clean up with other prediction parts
+    end
+}
+
+local function predictBallTrajectory()
+    -- Only update predictions at intervals to improve performance
+    local currentTime = tick()
+    if currentTime - lastUpdateTime < CONFIG.UPDATE_INTERVAL and #predictionParts > 0 then
+        return
+    end
+    lastUpdateTime = currentTime
+    
+    cleanupPrediction()
+
+    local gravity = workspace.Gravity
+    local position = ball.Position
+    local velocity = ball.AssemblyLinearVelocity
+    local lastPos = position
+    
+    -- Make a hit test to see if ball is touching ground or other objects
+    local isGrounded = false
+    local raycast = workspace:Raycast(
+        position,
+        Vector3.new(0, -1, 0) * (ball.Size.Y/2 + 0.1),
+        RaycastParams.new()
+    )
+    isGrounded = raycast ~= nil
+
+    for i = 1, CONFIG.PREDICTION_POINTS do
+        local timeStep = i * CONFIG.PREDICTION_STEP
+
+        local airResistance = 0.02
+        local velocityDecay = 1 - (airResistance * velocity.Magnitude * CONFIG.PREDICTION_STEP)
+        if velocityDecay < 0.9 then velocityDecay = 0.9 end
+
+        velocity = velocity * velocityDecay
+        
+        -- Only apply gravity if not grounded
+        if not isGrounded then
+            velocity = velocity + Vector3.new(0, -gravity, 0) * CONFIG.PREDICTION_STEP
+        else
+            -- Apply ground friction for rolling
+            local horizontalVel = Vector3.new(velocity.X, 0, velocity.Z)
+            local friction = 0.05
+            horizontalVel = horizontalVel * (1 - friction)
+            velocity = Vector3.new(horizontalVel.X, velocity.Y, horizontalVel.Z)
+        }
+        
+        position = position + velocity * CONFIG.PREDICTION_STEP
+
+        local raycast = workspace:Raycast(
+            position + Vector3.new(0, 0.5, 0), 
+            Vector3.new(0, -1, 0), 
+            RaycastParams.new()
+        )
+
+        if raycast and raycast.Position.Y > position.Y then
+            position = raycast.Position + Vector3.new(0, ball.Size.Y/2, 0)
+            isGrounded = true
+
+            local bounceFactor = 0.7
+            velocity = Vector3.new(velocity.X * 0.9, math.abs(velocity.Y) * bounceFactor, velocity.Z * 0.9)
+        else
+            isGrounded = false
+        end
+
+        local predictionPart = createPredictionPart(position, i, CONFIG.PREDICTION_POINTS)
+
+        if i > 1 then
+            connectPoints(lastPos, position, i)
+        end
+
+        lastPos = position
+    end
+    
+    -- Store the final predicted position for shadow guidance
+    predictionEndPoint = position
+end
+
+local function updateDistanceDisplay()
+    if not rootPart or not ball then return end
+
+    local distance = (rootPart.Position - ball.Position).Magnitude
+    distanceLabel.Text = string.format("Ball Distance: %dm", math.floor(distance))
+
+    if distance < CONFIG.ACTIVATION_DISTANCE then
+        modifyBallSize(true)
+
+        local ballToPlayer = (rootPart.Position - ball.Position).Unit
+        local ballVelocity = ball.AssemblyLinearVelocity
+        local ballSpeed = ballVelocity.Magnitude
+        local dotProduct = ballVelocity:Dot(ballToPlayer)
+
+        if distance < 3 and ballSpeed > 20 and dotProduct > 0.7 then
+            stopBallCompletely()
+        end
+    else
+        modifyBallSize(false)
+    end
+}
+
+local function setupBall(newBall)
+    ball = newBall
+    originalBallSize = ball.Size
+    originalBallColor = ball.Color
+
+    if ballHighlight then
+        ballHighlight:Destroy()
+    end
+
+    ballHighlight = Instance.new("Highlight")
+    ballHighlight.Name = "VelocityHighlight"
+    ballHighlight.FillTransparency = 0.5
+    ballHighlight.OutlineTransparency = 0
+    ballHighlight.FillColor = CONFIG.COLOR_SLOW
+    ballHighlight.OutlineColor = CONFIG.COLOR_SLOW
+    ballHighlight.Parent = ball
+end
+
+-- Initialize
+animateMangaMessage()
+
+-- Update team label
+teamLabel.Text = "Team: " .. (playerTeam or "Unknown")
+
+-- Toggle buttons
+toggleButton.MouseButton1Click:Connect(function()
+    predictingActive = not predictingActive
+    toggleButton.Text = predictingActive and "Prediction: ON" or "Prediction: OFF"
+    toggleButton.BackgroundColor3 = predictingActive and 
+        Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+
+    if not predictingActive then
+        cleanupPrediction()
+        -- Also hide shadow if prediction is turned off
+        setShadowVisibility(false)
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+    end
+end)
+
+shadowToggleButton.MouseButton1Click:Connect(function()
+    local shadowEnabled = shadowToggleButton.Text == "Shadow Guide: OFF"
+    shadowToggleButton.Text = shadowEnabled and "Shadow Guide: ON" or "Shadow Guide: OFF"
+    shadowToggleButton.BackgroundColor3 = shadowEnabled and 
+        Color3.fromRGB(50, 150, 150) or Color3.fromRGB(150, 50, 50)
+
+    if not shadowEnabled then
+        if shadowCharacter then
+            setShadowVisibility(false)
+        end
+        if guideLine then
+            guideLine:Destroy()
+            guideLine = nil
+        end
+    end
+end)
+
+-- Performance optimization: Use RenderStepped for visual updates
+-- and Heartbeat for physics/prediction updates to reduce lag
+RunService.RenderStepped:Connect(function()
+    updateDistanceDisplay()
+    updateBallHighlight()
+})
+
+-- Main physics update loop
+RunService.Heartbeat:Connect(function()
+    if predictingActive then
+        predictBallTrajectory()
+    end
+    
+    -- Update shadow position after ball prediction
+    updateShadowPosition()
+})
+
+-- Watch for new balls added to the workspace
+workspace.ChildAdded:Connect(function(child)
+    if child.Name == "Football" then
+        wait(0.1) 
+        setupBall(child)
+    end
+    
+    -- Also watch for goal additions
+    if child.Name == "Goal" or child.Name == "Goal2" then
+        wait(0.1)
+        findGoals()
+        teamLabel.Text = "Team: " .. (playerTeam or "Unknown")
+    end
+})
+
+-- Reconnect when player character changes
+player.CharacterAdded:Connect(function(newCharacter)
+    character = newCharacter
+
+    wait(1)
+    humanoid = character:FindFirstChild("Humanoid")
+    rootPart = character:FindFirstChild("HumanoidRootPart")
+    
+    -- Redetermine which goal is the player's
+    wait(0.5)
+    findGoals()
+    teamLabel.Text = "Team: " .. (playerTeam or "Unknown")
+    
+    -- Recreate shadow when character respawns
+    wait(0.5)
+    createShadowCharacter()
+
+    if mangaMessageGui.Parent == nil then
+        mangaMessageGui = Instance.new("ScreenGui")
+        mangaMessageGui.Name = "MangaMessage"
+        mangaMessageGui.ResetOnSpawn = false
+        mangaMessageGui.Parent = playerGui
+
+        mangaMessage = Instance.new("TextLabel")
+        mangaMessage.Size = UDim2.new(0.8, 0, 0.2, 0)
+        mangaMessage.Position = UDim2.new(0.1, 0, 0.4, 0)
+        mangaMessage.BackgroundTransparency = 1
+        mangaMessage.TextColor3 = Color3.fromRGB(255, 255, 255)
+        mangaMessage.Text = "Auf die Knie, Blue Lock!\nYour Kaiser has arrived!"
+        mangaMessage.TextSize = 48
+        mangaMessage.Font = Enum.Font.Bangers
+        mangaMessage.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+        mangaMessage.TextStrokeTransparency = 0
+        mangaMessage.TextWrapped = true
+        mangaMessage.RichText = true
+        mangaMessage.TextScaled = true
+        mangaMessage.Parent = mangaMessageGui
+
+        animateMangaMessage()
+    end
+end)
+
+-- Watch for goal post changes in the workspace
+workspace.DescendantAdded:Connect(function(descendant)
+    if descendant.Name == "Goal" or descendant.Name == "Goal2" then
+        wait(0.5)
+        findGoals()
+        teamLabel.Text = "Team: " .. (playerTeam or "Unknown")
+    end
+end)
+
+setupBall(ball)
+createShadowCharacter()
